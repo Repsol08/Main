@@ -1,0 +1,171 @@
+"""
+-*- coding: utf-8 -*-
+Title: BD_Wuhan_Education_req.py
+Version: 0.1.1
+Author: J German
+Maintainer: J German
+Description: Reads raw POI result files, parses, and appends to csv 
+
+Edit:  2022APR18 LCDR Walter Gunter
+Adjusted columns to read from all data sources, map to v6 schema, and save as a csv
+"""
+
+import os
+import sys
+import csv
+import time
+from datetime import datetime
+from numpy import append
+import pinyin_jyutping_sentence
+from openpyxl import load_workbook
+import pandas as pd
+import codecs
+import json
+import logging
+import ast 
+import re
+import ExcelHelperFunctions3 as excelHelper
+
+currentTime =  datetime.now().strftime("%Y_%m_%d-%I_%M_%S_%p")
+logFilename = "logs\\" + currentTime + "_std.log"
+## make sure log folder exists, if not, create it
+os.makedirs("logs", exist_ok=True)
+
+## clear existing handlers
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+    
+logging.basicConfig(filename= logFilename, filemode='a', format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+logger=logging.getLogger() 
+logger.addHandler(logging.StreamHandler(sys.stdout))
+#Now we are going to Set the threshold of logger to DEBUG 
+logger.setLevel(logging.DEBUG)
+
+class BD_Parse:
+
+    def __init__(self, workingDirectory, outputFileName):
+        self.workingDirectory = workingDirectory
+        self.outputFileName   = outputFileName
+        os.makedirs(outputFileName, exist_ok=True)
+        print(logger)
+
+    def convertJsonToDataframe(self, rawJson):
+        # normalize the column names to a flat list
+        df = pd.json_normalize(rawJson)
+
+        tempTime =  datetime.today().strftime("%m/%d/%y")
+        # Create the pandas DataFrame
+        df2 = pd.DataFrame(columns = ['InfSrc1Dat', 'FeatureUID', 'FeatFunDes', 'NameNoRom', 'VarNoRom',  \
+                                    'ADM1', 'ADM2',  'ADM3', 'City', 'Area',  \
+                                    'Address', 'LocDesc', 'Telephone', 'Latitude', 'Longitude'])
+
+        ## Map the raw json data to v6 Schema
+        if 'alias' in df.columns:
+            logger.info("alias column exists")
+        else:
+            logger.error("alias column is missing. Adding", exc_info=True)
+            df['alias'] = " "
+            
+        if 'tel' in df.columns:
+            logger.info("tel column exists")
+        else:
+            logger.error('tel column is missing. Adding.', exc_info=True)
+            df['tel'] = " " 
+
+       # date_time_navi = datetime.fromtimestamp( df['navi_update_time'][0] ) 
+       
+        # using strftime() function to convert  
+        #datetime_str = date_time_navi.strftime("%m/%d/%y")
+
+        df2['VarNoRom']          = df['alias']
+        df2['Telephone']         = df['tel']
+        df2['FeatureUID']        = df['uid']
+        df2['FeatFunDes']        = df['std_tag']
+        df2['NameNoRom']         = df['name']
+        df2['ADM1']              = df['api_admin_info.prov_name'] #province
+        df2['ADM2']              = df['api_admin_info.city_name']  # city, chinese characters
+        df2['ADM3']              = df['admin_info.area_name']  #district
+        df2['City']              = df['api_admin_info.city_name'] # city, english
+        df2['Address']           = df['addr']
+        df2['LocDesc']           = df['address_norm']
+        df2['InfSrc1Dat']        = tempTime
+        # this needs to be converted from BD09 to WGS84
+        df2['Latitude']          = df['x']  # these need to be converted to Lat/Long
+        df2['Longitude']         = df['y']
+
+        return df2
+
+    def saveToExcel(self, file, saveLocation, dataframe):
+        #filename should be a combo of location and name
+            try:
+                # you can use this as an example if you want to get the time from file name
+                # i had used this in the filename at first, but now we are reading from all text files 
+                # and combining into city district category
+              #  fileNumber = [int(x) for x in re.findall(r'\d+',file)][0]
+                categoryName = str(file[0:3])
+                cityName = dataframe["ADM2"][0]
+                districtName = dataframe["ADM3"][0]
+                adm2Pinyin = pinyin_jyutping_sentence.pinyin(cityName, remove_tones=True)
+                # remove pinyin city 市 'shi'
+                adm2Pinyin = adm2Pinyin[:-3]
+                adm3Pinyin = pinyin_jyutping_sentence.pinyin(districtName, remove_tones=True)
+                # remove pinyin districty 区'qu'
+                adm3Pinyin =  adm3Pinyin[:-2]
+                locationName2 = saveLocation + "//" +"CHN_"+ adm2Pinyin + "_" + adm3Pinyin + "_"  + categoryName.upper()
+                # create if new, add to existing file if exists.
+                # doing this since the reaper tool will do the breakdown based on City and District
+                # challenge exists - even with the groupings, sometimes there's not a lot, but maybe something wrong or missing
+                excelHelper.append_df_to_excel(locationName2, dataframe)
+                success = True
+            except Exception as s:
+                logger.error("unable to save file " , exc_info=True)
+                success = False
+            return success
+
+
+    def checkAndConvertFileToJson(self, file):
+        try:
+            json_data = json.load(file)
+            formattedFile = json_data
+        except json.decoder.JSONDecodeError:
+            logger.error("issue with json file", exc_info=True)
+            data_dict = ast.literal_eval(file)
+            json_string = json.dumps(data_dict, ensure_ascii=False)
+            json_data = json.loads(json_string)
+            formattedFile = json_data
+        return formattedFile
+
+
+    def bd_parse(self):
+            for file in os.listdir(self.workingDirectory):
+                print(file)
+                try:
+                    logger.info("Load Json File " + file)
+                    filePath = self.workingDirectory + '/' + file
+                    with codecs.open(filePath, 'r', 'utf-8') as data_file:
+                        try:
+                            # ok, this is strange. I remove this line and I Cannot read the bad json formatted files?
+                            # if i leave this in, it fails here in the try, but then skips to the except and works?  ha! no idea.
+                            print(os.stat(data_file).st_size == 0)
+                            json_data = json.load(data_file)
+                        except Exception as s:
+                            data = data_file.read()
+                            print("this is the data: I think: ", data)
+                            data_dict   = ast.literal_eval(data)
+                            json_string = json.dumps(data_dict, ensure_ascii=False)
+                            json_data   = json.loads(json_string)
+                            df29 = pd.json_normalize(json_data)
+                        jsonToDf = self.convertJsonToDataframe(json_data)
+                        writeToFile = self.saveToExcel(file, self.outputFileName, jsonToDf)
+                except Exception as s:
+                    logger.error("problem loading JSON file "+ file, exc_info=True)
+          
+    def convertLocationToLatLong():
+                    print("gonna do some maths")
+
+
+
+
+#bd = BD_Parse("Wu_Edu_042022", "export/")
+#bd.bd_parse()
